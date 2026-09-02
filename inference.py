@@ -32,9 +32,9 @@ def _torch_load(path: Path, device: torch.device) -> dict[str, Any]:
 
 def load_fold_checkpoint(path: str | Path, device: torch.device) -> LoadedFold:
     checkpoint = _torch_load(Path(path), device)
-    if int(checkpoint.get("format_version", 0)) != 6:
+    if int(checkpoint.get("format_version", 0)) != 7:
         raise RuntimeError(
-            "Checkpoint predates causal Radar filtering and the current numerically stable EO/calibration contract. "
+            "Checkpoint predates sparse-Radar-safe temporal association and the current preprocessing contract. "
             "It cannot be reused; retrain this fold from scratch."
         )
     config = ProjectConfig.from_dict(checkpoint["project_config"])

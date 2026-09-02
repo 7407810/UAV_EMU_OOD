@@ -165,9 +165,9 @@ def _fold_checkpoint_payload(
     kind: str,
 ) -> dict[str, Any]:
     return {
-        # v6 additionally makes auxiliary DINO inference numerically isolated,
-        # and uses linear (unbounded) Radar translation to avoid sinh overflow.
-        "format_version": 6,
+        # v7 makes sparse Radar temporal statistics differentiable at zero
+        # variance and uses deterministic physical association weights.
+        "format_version": 7,
         "kind": kind,
         "is_best": True,
         "fold": int(fold),
@@ -234,7 +234,7 @@ def _run_pretraining_parity_probe(
         "probe_fold": probe_fold,
         "validation_indices": folds[probe_fold][1].tolist(),
         "config": config.to_dict(),
-        "radar_preprocess_revision": 6,
+        "radar_preprocess_revision": 7,
     })
     report_path = probe_dir / "report.json"
     if checkpoint_path.is_file() and oof_path.is_file() and report_path.is_file():

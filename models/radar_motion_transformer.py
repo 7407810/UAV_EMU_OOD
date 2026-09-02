@@ -100,7 +100,10 @@ class RadarMotionTransformer(nn.Module):
         encoder = nn.TransformerEncoderLayer(dim, heads, dim_feedforward=dim * 4, dropout=dropout, batch_first=True, norm_first=True, activation="gelu")
         self.point_transformer = nn.TransformerEncoder(encoder, num_layers=layers)
         self.query = nn.Parameter(torch.randn(1, slots + 1, dim) * 0.02)  # final query is clutter/allowlist sink
-        self.cross_attention = nn.MultiheadAttention(dim, heads, dropout=dropout, batch_first=True)
+        # These attention weights are used as physical association weights for
+        # the anchor, so they must stay normalized and deterministic.  Applying
+        # dropout here can zero the complete distribution for a sparse cloud.
+        self.cross_attention = nn.MultiheadAttention(dim, heads, dropout=0.0, batch_first=True)
         self.track_norm = nn.LayerNorm(dim)
         self.track_presence = nn.Sequential(nn.LayerNorm(dim), nn.Linear(dim, 1))
         self.temporal_statistics = nn.Sequential(nn.Linear(2, dim), nn.GELU(), nn.Linear(dim, dim))
@@ -130,9 +133,14 @@ class RadarMotionTransformer(nn.Module):
         normalized_assignment = assignment / assignment.sum(dim=-1, keepdim=True).clamp_min(1e-8)
         reference = torch.einsum("bsp,bpc->bsc", normalized_assignment, xyz)
         mean_time = (normalized_assignment * rel_time.unsqueeze(1)).sum(dim=-1)
-        time_std = torch.sqrt(
-            (normalized_assignment * (rel_time.unsqueeze(1) - mean_time.unsqueeze(-1)).square()).sum(dim=-1).clamp_min(0.0)
-        )
+        time_variance = (
+            normalized_assignment * (rel_time.unsqueeze(1) - mean_time.unsqueeze(-1)).square()
+        ).sum(dim=-1)
+        # A one-point cloud has exactly zero temporal variance.  sqrt(0) has an
+        # infinite derivative and previously produced non-finite gradients in
+        # Radar query/calibration parameters.  This is a numerical derivative
+        # floor (1 ms standard deviation), not a timing/trajectory assumption.
+        time_std = torch.sqrt(time_variance.clamp_min(1.0e-6))
         temporal_token = self.temporal_statistics(torch.stack([mean_time / 3.0, time_std / 3.0], dim=-1))
         # No velocity law and no hard metre cap: the neural temporal head learns
         # whatever t=0 correction is supported by the indexed training data.
