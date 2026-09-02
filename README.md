@@ -1,83 +1,73 @@
-# MultimodalUAVOODNet
+# UAV ENU OOD — 多模态 Set Prediction
 
-固定 8-slot、RF 主导识别、Radar 物理轨迹定位的 OOD 无人机 ENU 工程。训练数据严格只来自 `train/index.csv`，公开测试严格只来自 `test_public/index.csv`；`val/` 不会读取。
+本工程只读取 `train/index.csv` 的 7362 条训练样本与
+`test_public/index.csv` 的 487 条测试样本，不扫描目录混入旧文件。
+`val/` 不参与训练、验证或模型选择。
 
-## DINOv3 ViT-S+/16 distilled EO 依赖
-
-EO 是辅助模态，不是检测器，也不需要任何框/掩码标注。项目固定使用官方 DINOv3 ViT-S+/16 distilled 的 LVD-1689M 权重；为保证 checkpoint parity，训练和推理都只接受本地仓库与本地权重，绝不在运行期联网下载或静默回退到随机骨干。加载时只导入 `dinov3.hub.backbones`，不会通过 `hubconf.py` 连带导入不需要的分割/检测依赖。
-
-运行环境必须是 **Python 3.10+**、PyTorch 2.0+。Python 3.9 无法导入当前官方 DINOv3 源码。
-
-服务器上建议固定到以下位置：
-
-```bash
-git clone https://github.com/facebookresearch/dinov3.git /data1/whd/AI_wireless/dinov3-main
-mkdir -p /data1/whd/AI_wireless/dinov3-main/weights
-```
-
-先在 Meta 官方 DINOv3 权重申请页接受许可；获批邮件会给出 `ViT-S+/16 distilled LVD-1689M` 的下载 URL。用邮件中的 URL 下载，文件必须放为：
+## 当前架构
 
 ```text
-/data1/whd/AI_wireless/dinov3-main/weights/dinov3_vits16plus_pretrain_lvd1689m-4057cbaa.pth
+4-node IQ (Raw-IQ CNN + sr-aware STFT CNN) ──> RF tokens
+Radar [E,N,U,rel_time_s] ────────────────────> Point Transformer tokens
+optional EO image (letterbox + DINOv3 patch tokens) ─> EO tokens
+                                                     │
+3 learnable unordered Target Queries
+  self-attention -> Radar cross-attention -> RF cross-attention -> EO cross-attention
+                                                     │
+  objectness, 8-way model logits, ENU mean, ENU log-sigma
 ```
 
-例如（将 `<APPROVED_URL>` 原样替换为邮件里的 URL）：
+- 三个 query 不绑定型号或坐标；训练使用 Hungarian matching。
+- Radar 没有手写 yaw/translation 校准、匀速外推、轨迹锚点、手工统计特征或固定型号槽位。
+- ENU 和 Radar 标准化严格由当前 train fold 统计；目标位置直接端到端回归。
+- `allowlist` 仅在最终 model logits 上 hard-mask，再生成集合，提交审计强制验证违规数为零。
+- 训练、验证、parity、测试完全复用同一 `Dataset` 与 `run_inference` 路径。旧固定-slot checkpoint 会被拒绝。
 
-```bash
-wget -O /data1/whd/AI_wireless/dinov3-main/weights/dinov3_vits16plus_pretrain_lvd1689m-4057cbaa.pth '<APPROVED_URL>'
-sha256sum /data1/whd/AI_wireless/dinov3-main/weights/dinov3_vits16plus_pretrain_lvd1689m-4057cbaa.pth
-```
+每个 epoch 输出并保存：micro/macro F1、exact-set accuracy、count accuracy、E/N/U MAE、3D mean/median/P75/P90/P95，以及按目标数量、model ID 的定位误差。工程不会把任何自定义指标称为 LocMass。
 
-校验结果必须以 `4057cbaa` 开头；工程会在任何训练前再次校验。官方 DINOv3 仓库与其 PyTorch-Hub 用法见 [facebookresearch/dinov3](https://github.com/facebookresearch/dinov3)；DINOv3 完整训练/评估环境要求 PyTorch 2.7.1+，本工程至少需要能运行该官方 backbone 的 PyTorch 版本。
-
-## 唯一主命令
-
-服务器完整 5-fold：
-
-```bash
-python -u train_end2end.py \
-  --data-root "/data1/whd/AI_wireless/dataset" \
-  --output-dir "./outputs" --folds 5 --epochs 120 \
-  --dinov3-repo-dir "/data1/whd/AI_wireless/dinov3-main" \
- --eo-pretrained-path "/data1/whd/AI_wireless/dinov3-main/weights/dinov3_vits16plus_pretrain_lvd1689m-4057cbaa.pth"
-```
-
-任意 `--folds >=2` 都可使用。若只训练一个指定折、但仍要直接生成单 checkpoint submission，可使用：
+## 服务器：完整五折训练与提交
 
 ```bash
 python -u train_end2end.py \
   --data-root "/data1/whd/AI_wireless/dataset" \
-  --output-dir "./outputs" --folds 5 --epochs 15 --only-fold 0 \
-  --single-fold-submission --reuse-folds
-```
-
-这里的 `1/5` 指的是先建立 5-fold session-CV 切分，再只使用第 0 折（4/5 训练、1/5 验证）训练/推理；它不是 5 个 checkpoint ensemble。生成前仍会强制该折 OOF parity，通过后写出 `outputs/submission.jsonl`。
-
-先验证一个严格 session-CV fold（不生成 submission）：
-
-```bash
-python -u train_end2end.py \
-  --data-root "/data1/whd/AI_wireless/dataset" \
-  --output-dir "./outputs" --folds 5 --epochs 15 --only-fold 0 \
+  --output-dir "./outputs_set_query" \
+  --folds 5 --epochs 120 \
+  --model-scale auto \
   --dinov3-repo-dir "/data1/whd/AI_wireless/dinov3-main" \
   --eo-pretrained-path "/data1/whd/AI_wireless/dinov3-main/weights/dinov3_vits16plus_pretrain_lvd1689m-4057cbaa.pth"
 ```
 
-本地完整 5-fold：
+输出为 `outputs_set_query/submission.jsonl`。每个 fold 的 best checkpoint 都先通过 validation-as-test parity；任何 parity 失败会直接中止，禁止生成 submission。
 
-```powershell
-python -u train_end2end.py `
-  --data-root "E:\self_data\competition\AI+无线电\复\数据" `
-  --output-dir "E:\self_data\competition\AI+无线电\复\code\uav_emu_ood\outputs" `
-  --folds 5 --epochs 120 `
-  --dinov3-repo-dir "E:\self_data\competition\AI+无线电\复\third_party\dinov3" `
-  --eo-pretrained-path "E:\self_data\competition\AI+无线电\复\weights\dinov3_vits16plus_pretrain_lvd1689m-4057cbaa.pth"
-```
-
-启动顺序固定为：权限/路径检查、index 驱动的数据审计、trajectory/session CV、可信度诊断、预训练 checkpoint parity probe、训练与 OOF、saved-checkpoint parity gate、checkpoint ensemble（或显式单折）、allowlist hard mask、submission 审计。任何 parity 不一致都会抛错并禁止生成 submission。
-
-单独复核已保存 fold：
+## 先跑 fold 0（不提交）
 
 ```bash
-python -u parity_check.py --data-root <DATA_ROOT> --checkpoint outputs/fold_0/best.pt --oof outputs/fold_0/oof_best.npz
+python -u train_end2end.py \
+  --data-root "/data1/whd/AI_wireless/dataset" \
+  --output-dir "./outputs_set_query_fold0" \
+  --folds 5 --epochs 15 --only-fold 0 \
+  --model-scale auto \
+  --dinov3-repo-dir "/data1/whd/AI_wireless/dinov3-main" \
+  --eo-pretrained-path "/data1/whd/AI_wireless/dinov3-main/weights/dinov3_vits16plus_pretrain_lvd1689m-4057cbaa.pth"
+```
+
+若需以该单折 checkpoint 直接生成调试提交，增加 `--single-fold-submission`。它不是五折 ensemble。
+
+## EO 消融
+
+EO 是可选模态。没有可用本地 DINO 权重、或严格 CV 未验证其收益时，直接加：
+
+```bash
+--disable-eo
+```
+
+此模式不会导入或下载 DINO，网络使用显式 missing-modality token。启用 EO 时要求 Python 3.10+，DINOv3 仓库和权重都必须在本地；工程不会联网下载权重。
+
+## 单独复核 parity
+
+```bash
+python -u parity_check.py \
+  --data-root "/data1/whd/AI_wireless/dataset" \
+  --checkpoint "./outputs_set_query/fold_0/best.pt" \
+  --oof "./outputs_set_query/fold_0/oof_best.npz"
 ```

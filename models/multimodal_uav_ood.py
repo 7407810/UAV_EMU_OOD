@@ -1,90 +1,158 @@
-"""Fixed-slot multimodal OOD network for UAV recognition and ENU positioning."""
+"""End-to-end multimodal unordered target-query network."""
 from __future__ import annotations
 
-from typing import Any, Mapping
+from typing import Mapping
 
 import torch
 from torch import nn
 
 from config import DataConfig, ModelConfig
 from .eo_encoder import EOEncoder
-from .radar_motion_transformer import RadarMotionTransformer
+from .radar_motion_transformer import RadarPointTransformer
 from .rf_encoder import RFEncoder
 
 
-class MultimodalUAVOODNet(nn.Module):
-    """Eight permanent model-id slots; no unordered queries or matching stage."""
+class TargetDecoderLayer(nn.Module):
+    """Self-attention followed by Radar -> RF -> EO cross-attention."""
 
-    def __init__(
-        self,
-        data_cfg: DataConfig,
-        model_cfg: ModelConfig,
-        calibration_init: Mapping[str, Any] | None = None,
-    ) -> None:
+    def __init__(self, dim: int, heads: int, dropout: float) -> None:
         super().__init__()
-        if data_cfg.num_slots != model_cfg.num_slots:
-            raise ValueError("Data/model slot count must match")
-        if model_cfg.eo_backbone != "dinov3_vits16plus":
-            raise ValueError(f"Unsupported EO backbone contract: {model_cfg.eo_backbone}")
-        self.data_cfg, self.model_cfg = data_cfg, model_cfg
-        dim, slots = model_cfg.dim, model_cfg.num_slots
-        self.rf = RFEncoder(dim, model_cfg.rf_raw_width, model_cfg.rf_spec_width, model_cfg.heads, model_cfg.rf_node_layers, model_cfg.dropout, slots)
-        self.radar = RadarMotionTransformer(
-            dim, model_cfg.heads, model_cfg.radar_layers, model_cfg.dropout, slots, calibration_init,
+        self.self_norm = nn.LayerNorm(dim)
+        self.radar_norm = nn.LayerNorm(dim)
+        self.rf_norm = nn.LayerNorm(dim)
+        self.eo_norm = nn.LayerNorm(dim)
+        self.ffn_norm = nn.LayerNorm(dim)
+        self.self_attention = nn.MultiheadAttention(dim, heads, dropout=dropout, batch_first=True)
+        self.radar_attention = nn.MultiheadAttention(dim, heads, dropout=dropout, batch_first=True)
+        self.rf_attention = nn.MultiheadAttention(dim, heads, dropout=dropout, batch_first=True)
+        self.eo_attention = nn.MultiheadAttention(dim, heads, dropout=dropout, batch_first=True)
+        self.ffn = nn.Sequential(
+            nn.Linear(dim, dim * 4), nn.GELU(), nn.Dropout(dropout), nn.Linear(dim * 4, dim),
+        )
+        self.dropout = nn.Dropout(dropout)
+
+    def _cross(
+        self,
+        query: torch.Tensor,
+        memory: torch.Tensor,
+        key_padding_mask: torch.Tensor,
+        attention: nn.MultiheadAttention,
+        norm: nn.LayerNorm,
+    ) -> torch.Tensor:
+        update, _ = attention(norm(query), memory, memory, key_padding_mask=key_padding_mask, need_weights=False)
+        return query + self.dropout(update)
+
+    def forward(
+        self,
+        query: torch.Tensor,
+        radar_tokens: torch.Tensor,
+        radar_mask: torch.Tensor,
+        rf_tokens: torch.Tensor,
+        rf_mask: torch.Tensor,
+        eo_tokens: torch.Tensor,
+        eo_mask: torch.Tensor,
+    ) -> torch.Tensor:
+        update, _ = self.self_attention(self.self_norm(query), self.self_norm(query), self.self_norm(query), need_weights=False)
+        query = query + self.dropout(update)
+        query = self._cross(query, radar_tokens, radar_mask, self.radar_attention, self.radar_norm)
+        query = self._cross(query, rf_tokens, rf_mask, self.rf_attention, self.rf_norm)
+        query = self._cross(query, eo_tokens, eo_mask, self.eo_attention, self.eo_norm)
+        return query + self.dropout(self.ffn(self.ffn_norm(query)))
+
+
+class MultimodalUAVOODNet(nn.Module):
+    """Three unordered target queries for model ID, ENU and uncertainty.
+
+    Query ``i`` has no semantic model or position binding. It can represent any
+    target on any sample; Hungarian assignment supplies permutation-invariant
+    supervision. All Radar-to-current-position behavior is learned by the
+    point encoder and cross-modal decoder rather than an explicit motion model.
+    """
+
+    def __init__(self, data_cfg: DataConfig, model_cfg: ModelConfig, fold_stats: Mapping[str, object]) -> None:
+        super().__init__()
+        if data_cfg.num_queries != 3:
+            raise ValueError("The documented task permits at most three targets; num_queries must be 3")
+        if data_cfg.num_models != 8:
+            raise ValueError("The documented model space has exactly 8 classes")
+        if model_cfg.dim % model_cfg.heads:
+            raise ValueError(f"model dim {model_cfg.dim} must be divisible by heads {model_cfg.heads}")
+        self.data_cfg = data_cfg
+        self.model_cfg = model_cfg
+        dim = model_cfg.dim
+        self.rf = RFEncoder(
+            dim=dim,
+            raw_width=model_cfg.rf_raw_width,
+            spec_width=model_cfg.rf_spec_width,
+            heads=model_cfg.heads,
+            layers=model_cfg.rf_node_layers,
+            dropout=model_cfg.dropout,
+            num_nodes=data_cfg.num_nodes,
+        )
+        self.radar = RadarPointTransformer(
+            dim=dim,
+            heads=model_cfg.heads,
+            layers=model_cfg.radar_layers,
+            dropout=model_cfg.dropout,
+            fold_stats=fold_stats,
+            normalized_noise_std=model_cfg.radar_normalized_noise_std,
         )
         self.eo = EOEncoder(
             dim=dim,
             dropout_probability=data_cfg.modality_dropout,
+            enabled=model_cfg.use_eo,
             pretrained=model_cfg.eo_pretrained,
             pretrained_path=model_cfg.eo_pretrained_path,
             dinov3_repo_dir=model_cfg.dinov3_repo_dir,
             train_last_blocks=model_cfg.eo_train_last_blocks,
         )
-        self.model_embedding = nn.Parameter(torch.randn(1, slots, dim) * 0.02)
-        self.allowlist_embedding = nn.Embedding(2, dim)
-        self.modality_position = nn.Parameter(torch.randn(1, 3 + slots, dim) * 0.02)
-        fusion_layer = nn.TransformerEncoderLayer(dim, model_cfg.heads, dim_feedforward=dim * 4, dropout=model_cfg.dropout, batch_first=True, norm_first=True, activation="gelu")
-        self.fusion = nn.TransformerEncoder(fusion_layer, num_layers=model_cfg.fusion_layers)
-        self.slot_norm = nn.LayerNorm(dim)
-        self.fusion_presence = nn.Sequential(nn.LayerNorm(dim), nn.Linear(dim, 1))
-        self.fusion_residual = nn.Sequential(nn.LayerNorm(dim), nn.Linear(dim, dim), nn.GELU(), nn.Linear(dim, 3))
-        self.global_head = nn.Sequential(nn.LayerNorm(dim * 3), nn.Linear(dim * 3, dim), nn.GELU(), nn.Dropout(model_cfg.dropout))
-        self.count_head = nn.Linear(dim, 3)
+        self.target_queries = nn.Parameter(torch.randn(1, data_cfg.num_queries, dim) * 0.02)
+        self.decoder = nn.ModuleList([
+            TargetDecoderLayer(dim, model_cfg.heads, model_cfg.dropout)
+            for _ in range(model_cfg.decoder_layers)
+        ])
+        self.query_norm = nn.LayerNorm(dim)
+        self.objectness_head = nn.Linear(dim, 1)
+        self.model_head = nn.Linear(dim, data_cfg.num_models)
+        self.position_head = nn.Sequential(nn.Linear(dim, dim), nn.GELU(), nn.Linear(dim, 3))
+        self.log_sigma_head = nn.Sequential(nn.Linear(dim, dim), nn.GELU(), nn.Linear(dim, 3))
+        mean = torch.as_tensor(fold_stats["enu_mean"], dtype=torch.float32).flatten()
+        std = torch.as_tensor(fold_stats["enu_std"], dtype=torch.float32).flatten()
+        if mean.numel() != 3 or std.numel() != 3:
+            raise ValueError("fold_stats enu_mean/enu_std must each contain three values")
+        self.register_buffer("enu_mean", mean)
+        self.register_buffer("enu_std", std.clamp_min(1.0e-3))
+
+    def normalize_position(self, position: torch.Tensor) -> torch.Tensor:
+        return (position - self.enu_mean.view(1, 1, 3)) / self.enu_std.view(1, 1, 3)
+
+    def denormalize_position(self, position: torch.Tensor) -> torch.Tensor:
+        return position * self.enu_std.view(1, 1, 3) + self.enu_mean.view(1, 1, 3)
 
     def forward(self, batch: Mapping[str, torch.Tensor]) -> dict[str, torch.Tensor]:
-        rf = self.rf(batch["raw_iq"], batch["stft"], batch["rf_scalars"], batch["node_present"], batch["node_enu"])
+        rf = self.rf(batch["raw_iq"], batch["stft"], batch["rf_scalars"], batch["node_present"])
         radar = self.radar(batch["radar_points"], batch["radar_mask"])
-        eo_token = self.eo(batch["eo_image"], batch["has_eo"])
-        batch_size = batch["raw_iq"].shape[0]
-        allow_embedding = self.allowlist_embedding(batch["allowlist_mask"].long())
-        slot_tokens = self.model_embedding.expand(batch_size, -1, -1)
-        slot_tokens = slot_tokens + rf["rf_model_tokens"] + radar["radar_track_tokens"] + allow_embedding
-        context = torch.stack([rf["rf_global"], radar["radar_global"], eo_token], dim=1)
-        fused = self.fusion(torch.cat([context, slot_tokens], dim=1) + self.modality_position)
-        fused_slots = self.slot_norm(fused[:, 3:])
-        fusion_logits = self.fusion_presence(fused_slots).squeeze(-1)
-        # Recognition remains RF-led by construction. Radar has only a bounded
-        # weak contribution and is not allowed to become a location shortcut.
-        presence_logits = (
-            rf["rf_presence_logits"]
-            + self.model_cfg.radar_presence_scale * radar["radar_presence_logits"]
-            + self.model_cfg.fusion_presence_scale * fusion_logits
-        )
-        # The residual is learned directly from multimodal evidence.  No
-        # undocumented metre cap is imposed on its correction.
-        position_pred = radar["radar_position"] + self.fusion_residual(fused_slots)
-        global_token = self.global_head(torch.cat([rf["rf_global"], radar["radar_global"], eo_token], dim=-1))
+        eo = self.eo(batch["eo_image"], batch["has_eo"])
+        query = self.target_queries.expand(batch["raw_iq"].shape[0], -1, -1)
+        for layer in self.decoder:
+            query = layer(
+                query,
+                radar["tokens"], radar["key_padding_mask"],
+                rf["tokens"], rf["key_padding_mask"],
+                eo["tokens"], eo["key_padding_mask"],
+            )
+        query = self.query_norm(query)
+        position_mu_norm = self.position_head(query)
+        # Bounding uncertainty log-scale avoids degenerate numerical variance;
+        # it is not a bound on ENU coordinates or a model-specific range.
+        log_sigma_norm = self.log_sigma_head(query).clamp(min=-6.0, max=5.0)
+        position_mu = self.denormalize_position(position_mu_norm)
+        position_log_sigma = log_sigma_norm + torch.log(self.enu_std).view(1, 1, 3)
         return {
-            "presence_logits": presence_logits,
-            "position_pred": position_pred,
-            "count_logits": self.count_head(global_token),
-            "radar_anchor": radar["radar_anchor"],
-            "radar_assignment": radar["radar_assignment"],
-            "radar_sink_assignment": radar["radar_sink_assignment"],
-            "rf_presence_logits": rf["rf_presence_logits"],
-            "radar_presence_logits": radar["radar_presence_logits"],
-            "calibrated_radar": radar["calibrated_radar"],
+            "objectness_logits": self.objectness_head(query).squeeze(-1),
+            "model_logits": self.model_head(query),
+            "position_mu_norm": position_mu_norm,
+            "position_mu": position_mu,
+            "position_log_sigma_norm": log_sigma_norm,
+            "position_log_sigma": position_log_sigma,
         }
-
-    def calibration_state(self) -> dict[str, Any]:
-        return self.radar.calibration.export()

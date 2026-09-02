@@ -3,8 +3,8 @@ scipy>=1.11
 # Python >=3.10 is required by the official DINOv3 source checkout.
 pandas>=2.1
 scikit-learn>=1.4
-torch>=2.2
-torchvision>=0.17
+torch>=2.0
+torchvision>=0.15
 Pillow>=10.0
 tqdm>=4.66
 
