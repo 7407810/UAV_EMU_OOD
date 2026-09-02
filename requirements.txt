@@ -1,0 +1,12 @@
+numpy>=1.26
+scipy>=1.11
+# Python >=3.10 is required by the official DINOv3 source checkout.
+pandas>=2.1
+scikit-learn>=1.4
+torch>=2.2
+torchvision>=0.17
+Pillow>=10.0
+tqdm>=4.66
+
+# DINOv3 is intentionally loaded from a local clone passed with
+# --dinov3-repo-dir; it is not downloaded by this project at runtime.

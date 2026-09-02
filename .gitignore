@@ -1,0 +1,42 @@
+# Python runtime and editor state
+__pycache__/
+*.py[cod]
+*.so
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.venv/
+venv/
+.idea/
+.vscode/
+
+# Training artifacts, logs, submissions and caches
+outputs/
+logs/
+checkpoints/
+wandb/
+tensorboard/
+*.log
+
+# Large model/data artifacts (keep code and lightweight metadata only)
+*.pt
+*.pth
+*.ckpt
+*.onnx
+*.bin
+*.safetensors
+*.npz
+*.npy
+*.jpg
+*.jpeg
+*.png
+*.zip
+*.tar
+*.tar.gz
+
+# Credentials and machine-local configuration
+.env
+.env.*
+*.pem
+*.key
+secrets/
